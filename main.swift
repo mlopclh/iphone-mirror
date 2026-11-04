@@ -1,5 +1,6 @@
-// iPhone Mirror — shows a cable-connected iPhone's screen live on your Mac,
-// including the Camera app (it uses the same CoreMediaIO capture path QuickTime uses).
+// Phone Mirror — shows a cable-connected iPhone or Android phone's screen live on your Mac.
+// iPhone: same CoreMediaIO capture path QuickTime uses, so the Camera app shows too.
+// Android: runs scrcpy (brew install scrcpy) in its own window.
 // Frameless window, optional screen recording (Settings: ⌘, · Record: ⇧⌘R).
 import Cocoa
 import AVFoundation
@@ -15,7 +16,7 @@ func enableScreenCaptureDevices() {
     var allow: UInt32 = 1
     let err = CMIOObjectSetPropertyData(CMIOObjectID(kCMIOObjectSystemObject), &address,
                                         0, nil, UInt32(MemoryLayout<UInt32>.size), &allow)
-    if err != noErr { NSLog("iPhoneMirror: could not enable screen capture devices (\(err))") }
+    if err != noErr { NSLog("PhoneMirror: could not enable screen capture devices (\(err))") }
 }
 
 func iPhoneCaptureDevices() -> [AVCaptureDevice] {
@@ -26,13 +27,61 @@ func iPhoneCaptureDevices() -> [AVCaptureDevice] {
         .filter { $0.hasMediaType(.muxed) || $0.modelID.contains("iOS") }
 }
 
+// MARK: - Android (via adb + scrcpy)
+
+struct AndroidDevice: Equatable {
+    let serial: String
+    let state: String      // "device" = ready, "unauthorized" = waiting for Allow on the phone
+    let name: String
+    var ready: Bool { state == "device" }
+}
+
+enum Tools {
+    // GUI apps don't get your shell PATH, so look in the usual install locations.
+    static var dirs: [String] {
+        ["/opt/homebrew/bin", "/usr/local/bin", NSHomeDirectory() + "/Library/Android/sdk/platform-tools"]
+    }
+    static func find(_ name: String) -> String? {
+        dirs.map { $0 + "/" + name }.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+    static var environment: [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = (dirs + [env["PATH"] ?? "/usr/bin:/bin"]).joined(separator: ":")
+        if let adb = find("adb") { env["ADB"] = adb }
+        return env
+    }
+}
+
+/// Returns nil when adb isn't installed.
+func listAndroidDevices() -> [AndroidDevice]? {
+    guard let adb = Tools.find("adb") else { return nil }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: adb)
+    p.arguments = ["devices", "-l"]
+    p.environment = Tools.environment
+    let out = Pipe()
+    p.standardOutput = out
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { return [] }
+    let data = out.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+
+    return String(decoding: data, as: UTF8.self).split(separator: "\n").compactMap { line in
+        let parts = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
+        guard parts.count >= 2, !line.hasPrefix("List of devices"), !line.hasPrefix("*") else { return nil }
+        let model = parts.first { $0.hasPrefix("model:") }
+            .map { String($0.dropFirst(6)).replacingOccurrences(of: "_", with: " ") }
+        return AndroidDevice(serial: parts[0], state: parts[1], name: model ?? "Android phone")
+    }
+}
+
 // MARK: - Saved settings
 
 enum Prefs {
     static var saveFolder: URL {
         get {
             if let p = UserDefaults.standard.string(forKey: "saveFolder") { return URL(fileURLWithPath: p) }
-            return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Movies/iPhone Mirror")
+            return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Movies/Phone Mirror")
         }
         set { UserDefaults.standard.set(newValue.path, forKey: "saveFolder") }
     }
@@ -107,7 +156,7 @@ final class SettingsController: NSObject {
     private func build() {
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 210),
                          styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        w.title = "iPhone Mirror Settings"
+        w.title = "Phone Mirror Settings"
         w.isReleasedWhenClosed = false
 
         let header = NSTextField(labelWithString: "Recording")
@@ -185,7 +234,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     let statusLabel = NSTextField(wrappingLabelWithString: "")
     let recBadge = NSTextField(labelWithString: "")
     let session = AVCaptureSession()
-    let sessionQueue = DispatchQueue(label: "iphonemirror.capture")
+    let sessionQueue = DispatchQueue(label: "phonemirror.capture")
     let audioOut = AVCaptureAudioPreviewOutput()
     let movieOut = AVCaptureMovieFileOutput()
     let recDelegate = RecordingDelegate()
@@ -201,6 +250,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     var recordStart = Date()
     var recTimer: Timer?
 
+    // Android state
+    var androidDevices: [AndroidDevice] = []
+    var adbInstalled = true
+    var androidSerial: String?          // the phone scrcpy is showing
+    var androidName = ""
+    var scrcpy: Process?
+    var scrcpyLog = ""
+    var dismissedAndroid: Set<String> = []   // closed by you; not auto-reopened until replugged
+    var adbBusy = false
+    let adbQueue = DispatchQueue(label: "phonemirror.adb")
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildMenus()
         buildWindow()
@@ -211,11 +271,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         recDelegate.onStart = { [weak self] in self?.recordingStarted() }
         recDelegate.onFinish = { [weak self] url, err in self?.recordingStopped(url: url, error: err) }
 
-        setStatus("Connect your iPhone with a cable, unlock it, and tap “Trust” if asked…")
+        setStatus("Connect your iPhone or Android phone with a cable and unlock it.\niPhone: tap “Trust” if asked.\nAndroid: turn on USB debugging and tap “Allow”.")
+        Timer.scheduledTimer(timeInterval: 2, target: self, selector: #selector(pollAndroid), userInfo: nil, repeats: true)
+        pollAndroid()
         AVCaptureDevice.requestAccess(for: .video) { granted in
             DispatchQueue.main.async {
                 guard granted else {
-                    self.setStatus("Camera access is off for iPhone Mirror.\nTurn it on in System Settings › Privacy & Security › Camera, then reopen the app.")
+                    self.setStatus("Camera access is off for Phone Mirror.\nTurn it on in System Settings › Privacy & Security › Camera, then reopen the app.")
                     return
                 }
                 AVCaptureDevice.requestAccess(for: .audio) { _ in }
@@ -227,6 +289,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        scrcpy?.interrupt()
+    }
+
+    // Clicking the Dock icon while Android is showing brings the Android window forward.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if let p = scrcpy {
+            NSRunningApplication(processIdentifier: p.processIdentifier)?.activate(options: [])
+            return false
+        }
+        window.makeKeyAndOrderFront(nil)
+        return false
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard recording else { return .terminateNow }
@@ -242,7 +318,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 360, height: 780),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                           backing: .buffered, defer: false)
-        window.title = "iPhone Mirror"
+        window.title = "Phone Mirror"
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
@@ -356,30 +432,171 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         }
         for d in devices {
             let item = NSMenuItem(title: d.localizedName, action: #selector(pickDevice(_:)), keyEquivalent: "")
-            item.representedObject = d.uniqueID
+            item.representedObject = "ios:" + d.uniqueID
             item.state = (d.uniqueID == currentDevice?.uniqueID) ? .on : .off
             item.target = self
             deviceMenu.addItem(item)
+        }
+        for a in androidDevices {
+            let title = a.ready ? a.name : "\(a.name) (tap Allow on the phone)"
+            let item = NSMenuItem(title: title, action: a.ready ? #selector(pickDevice(_:)) : nil, keyEquivalent: "")
+            item.representedObject = "android:" + a.serial
+            item.state = (a.serial == androidSerial) ? .on : .off
+            item.target = self
+            deviceMenu.addItem(item)
+        }
+        if devices.isEmpty && !androidDevices.isEmpty {
+            deviceMenu.item(at: 0)?.isHidden = true   // hide "No iPhone found"
+        }
+        if !adbInstalled {
+            let hint = NSMenuItem(title: "Android: install scrcpy to enable (see README)", action: nil, keyEquivalent: "")
+            hint.isEnabled = false
+            deviceMenu.addItem(hint)
         }
         deviceMenu.addItem(.separator())
         let refresh = NSMenuItem(title: "Refresh", action: #selector(refreshAction), keyEquivalent: "r")
         refresh.target = self
         deviceMenu.addItem(refresh)
 
-        if currentDevice == nil, let first = devices.first {
+        // Nothing showing yet? Start the first phone available (iPhone first).
+        guard currentDevice == nil, androidSerial == nil else { return }
+        if let first = devices.first {
             startCapture(first)
+        } else if let a = androidDevices.first(where: { $0.ready && !dismissedAndroid.contains($0.serial) }) {
+            startAndroid(a)
+        } else if androidDevices.contains(where: { $0.state == "unauthorized" }) {
+            setStatus("Unlock your Android phone and tap “Allow” on the USB debugging prompt.")
         }
     }
 
-    @objc func refreshAction() { refreshDevices() }
-
-    @objc func pickDevice(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? String,
-              let dev = iPhoneCaptureDevices().first(where: { $0.uniqueID == id }) else { return }
-        startCapture(dev)
+    @objc func refreshAction() {
+        refreshDevices()
+        pollAndroid()
     }
 
+    @objc func pickDevice(_ sender: NSMenuItem) {
+        guard let tag = sender.representedObject as? String else { return }
+        if tag.hasPrefix("ios:") {
+            let id = String(tag.dropFirst(4))
+            if let dev = iPhoneCaptureDevices().first(where: { $0.uniqueID == id }) { startCapture(dev) }
+        } else if tag.hasPrefix("android:") {
+            let serial = String(tag.dropFirst(8))
+            dismissedAndroid.remove(serial)
+            if let a = androidDevices.first(where: { $0.serial == serial }) { startAndroid(a) }
+        }
+    }
+
+    // MARK: Android
+
+    @objc func pollAndroid() {
+        guard !adbBusy else { return }
+        adbBusy = true
+        adbQueue.async {
+            let list = listAndroidDevices()
+            DispatchQueue.main.async {
+                self.adbBusy = false
+                let installed = (list != nil)
+                let devices = list ?? []
+                // Forget "closed by you" once that phone is unplugged.
+                self.dismissedAndroid = self.dismissedAndroid.filter { s in devices.contains { $0.serial == s } }
+                guard devices != self.androidDevices || installed != self.adbInstalled else { return }
+                self.androidDevices = devices
+                self.adbInstalled = installed
+                self.refreshDevices()
+            }
+        }
+    }
+
+    func startAndroid(_ device: AndroidDevice) {
+        guard let bin = Tools.find("scrcpy") else {
+            window.makeKeyAndOrderFront(nil)
+            setStatus("To mirror Android phones, install scrcpy in Terminal:\nbrew install scrcpy\nbrew install --cask android-platform-tools")
+            return
+        }
+        if currentDevice != nil { stopCapture() }
+        stopAndroid()
+        androidSerial = device.serial
+        androidName = device.name
+        launchScrcpy(bin)
+        refreshDevices()
+    }
+
+    func launchScrcpy(_ bin: String) {
+        guard let serial = androidSerial else { return }
+        var args = ["--serial=\(serial)", "--window-title=\(androidName)", "--stay-awake"]
+        if !playAudio { args.append("--no-audio") }
+        if isFloating { args.append("--always-on-top") }
+        // Open the Android window where the Phone Mirror window is.
+        if let primary = NSScreen.screens.first {
+            let f = window.frame
+            args += ["--window-x=\(Int(f.minX))",
+                     "--window-y=\(Int(primary.frame.maxY - f.maxY))",
+                     "--window-height=\(Int(f.height))"]
+        }
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: bin)
+        p.arguments = args
+        p.environment = Tools.environment
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        pipe.fileHandleForReading.readabilityHandler = { h in
+            let data = h.availableData
+            if data.isEmpty { h.readabilityHandler = nil; return }
+            let s = String(decoding: data, as: UTF8.self)
+            DispatchQueue.main.async { self.scrcpyLog = String((self.scrcpyLog + s).suffix(2000)) }
+        }
+        p.terminationHandler = { proc in DispatchQueue.main.async { self.scrcpyExited(proc) } }
+
+        scrcpyLog = ""
+        do { try p.run() } catch {
+            androidSerial = nil
+            window.makeKeyAndOrderFront(nil)
+            setStatus("Couldn't start scrcpy:\n\(error.localizedDescription)")
+            return
+        }
+        scrcpy = p
+        setStatus(nil)
+        window.orderOut(nil)   // scrcpy shows the phone in its own window
+    }
+
+    func scrcpyExited(_ proc: Process) {
+        guard proc === scrcpy else { return }   // an old process we replaced on purpose
+        scrcpy = nil
+        if let serial = androidSerial { dismissedAndroid.insert(serial) }   // don't auto-reopen in a loop
+        androidSerial = nil
+        window.makeKeyAndOrderFront(nil)
+        if proc.terminationStatus == 0 {
+            setStatus("\(androidName) closed.\nPick it from the Device menu to show it again.")
+        } else {
+            let tail = scrcpyLog.split(separator: "\n").suffix(3).joined(separator: "\n")
+            setStatus("Android mirroring stopped.\n\(tail)")
+        }
+        refreshDevices()
+    }
+
+    func stopAndroid() {
+        if let p = scrcpy {
+            scrcpy = nil
+            p.interrupt()
+        }
+        androidSerial = nil
+    }
+
+    /// Restart scrcpy so a changed option (keep on top, audio) takes effect.
+    func relaunchAndroid() {
+        guard androidSerial != nil, let p = scrcpy, let bin = Tools.find("scrcpy") else { return }
+        scrcpy = nil
+        p.interrupt()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { self.launchScrcpy(bin) }
+    }
+
+    // MARK: iPhone capture
+
     func startCapture(_ device: AVCaptureDevice) {
+        stopAndroid()
+        window.makeKeyAndOrderFront(nil)
         let input: AVCaptureDeviceInput
         do { input = try AVCaptureDeviceInput(device: device) }
         catch {
@@ -411,7 +628,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     func stopCapture() {
         currentDevice = nil
         currentInput = nil
-        window.title = "iPhone Mirror"
+        window.title = "Phone Mirror"
         sessionQueue.async {
             if self.movieOut.isRecording { self.movieOut.stopRecording() }
             self.session.stopRunning()
@@ -435,7 +652,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         catch { showError("Can't save to \(folder.path)", error); return }
         let fmt = DateFormatter()
         fmt.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
-        let url = folder.appendingPathComponent("iPhone Mirror \(fmt.string(from: Date())).mov")
+        let url = folder.appendingPathComponent("Phone Mirror \(fmt.string(from: Date())).mov")
         let withAudio = Prefs.recordAudio
 
         // The recorder is only attached while recording, so it can't lower live-view quality.
@@ -462,7 +679,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             device.activeFormat = best
             device.unlockForConfiguration()
         } catch {
-            NSLog("iPhoneMirror: couldn't set format (\(error))")
+            NSLog("PhoneMirror: couldn't set format (\(error))")
         }
     }
 
@@ -531,9 +748,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         settingsItem.target = self
         appMenu.addItem(settingsItem)
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Hide iPhone Mirror", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: "Hide Phone Mirror", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Quit iPhone Mirror", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "Quit Phone Mirror", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
         main.addItem(appItem)
 
@@ -601,7 +818,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         let s = NSMenuItem(title: "Settings…", action: #selector(showSettings), keyEquivalent: "")
         s.target = self
         m.addItem(s)
-        m.addItem(withTitle: "Quit iPhone Mirror", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
+        m.addItem(withTitle: "Quit Phone Mirror", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "")
         return m
     }
 
@@ -624,11 +841,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func toggleFloat() {
         isFloating.toggle()
         window.level = isFloating ? .floating : .normal
+        relaunchAndroid()
     }
 
     @objc func toggleAudio() {
         playAudio.toggle()
         audioOut.volume = playAudio ? 1 : 0
+        relaunchAndroid()
     }
 
     @objc func toggleControls() {
